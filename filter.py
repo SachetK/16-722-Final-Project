@@ -2,9 +2,6 @@ import numpy as np
 from statistics import median
 from trilateration import rssi_to_distance
 
-# How many recent RSSI samples to keep per beacon
-RSSI_WIN = 7
-
 def robust_likelihood(d_meas, d_pred, sigma=0.8):
     """Cauchy likelihood: much less sensitive to outliers than Gaussian."""
     return 1.0 / (1.0 + ((d_meas - d_pred) / sigma) ** 2)
@@ -19,10 +16,15 @@ class ParticleFilter2D:
         num_particles=2000,
         motion_std=0.03,
         meas_std=0.8,
+        likelihood_temp=0.5,
     ):
         """
         beacons: dict {minor_id: (bx, by)}
         x_range, y_range: (min, max)
+
+        motion_std: std dev (m) per second of random walk.
+        meas_std:   scale (m) for Cauchy likelihood.
+        likelihood_temp: 0 < T <= 1.  Smaller T => flatter likelihood (less collapse).
         """
 
         self.beacons = beacons
@@ -32,6 +34,7 @@ class ParticleFilter2D:
         self.N = num_particles
         self.motion_std = motion_std
         self.meas_std = meas_std
+        self.likelihood_temp = likelihood_temp
 
         # Particles
         self.particles = np.empty((self.N, 2), dtype=np.float32)
@@ -40,7 +43,7 @@ class ParticleFilter2D:
 
         self.weights = np.ones(self.N, dtype=np.float32) / self.N
 
-        # Per-beacon RSSI history for smoothing
+        # Per-beacon RSSI history for smoothing (used in real-time code if needed)
         self.rssi_hist = {bid: [] for bid in beacons}
 
     # -----------------------------------------------------
@@ -51,9 +54,7 @@ class ParticleFilter2D:
         Add a time-scaled random walk.
         Larger dt → larger positional uncertainty.
         """
-        # scale noise linearly with dt
         std = self.motion_std * dt
-
         noise = np.random.normal(0, std, size=self.particles.shape)
         self.particles += noise
 
@@ -79,12 +80,8 @@ class ParticleFilter2D:
             if rssi >= -40 or rssi < -95:
                 continue
 
-            # Convert RSSI → distance (your trilateration model)
             d = rssi_to_distance(rssi)
-
-            # Distance sanity clamp
-            d = float(np.clip(d, 0.2, 6.0))
-
+            d = float(np.clip(d, 0.2, 6.0))  # sanity clamp
             dist_meas[minor] = d
 
         # Not enough signals → skip measurement update
@@ -102,13 +99,23 @@ class ParticleFilter2D:
             d_pred = np.sqrt(dx * dx + dy * dy)
 
             L = robust_likelihood(d_meas, d_pred, sigma=self.meas_std)
+
+            # ---- soften likelihood to avoid over-collapse ----
+            # L in (0,1]; raising to T<1 makes it flatter (less peaky)
+            L = np.power(L, self.likelihood_temp)
+
             new_w *= L
 
         # Normalize
-        new_w += 1e-12
-        new_w /= np.sum(new_w)
+        new_w += 1e-20
+        total = np.sum(new_w)
+        if total <= 0.0 or not np.isfinite(total):
+            # In pathological cases, reset to uniform
+            self.weights.fill(1.0 / self.N)
+        else:
+            new_w /= total
+            self.weights = new_w.astype(np.float32)
 
-        self.weights = new_w.astype(np.float32)
         self._resample_if_needed()
 
     # -----------------------------------------------------
@@ -128,6 +135,17 @@ class ParticleFilter2D:
 
         self.particles = self.particles[idx]
         self.weights.fill(1.0 / N)
+
+    def particle_spread(self):
+        """
+        Compute PF uncertainty as mean particle distance from the weighted mean.
+        (Simple scalar uncertainty metric.)
+        """
+        mean = self.estimate()  # weighted [x, y]
+        dx = self.particles[:, 0] - mean[0]
+        dy = self.particles[:, 1] - mean[1]
+        dist = np.sqrt(dx*dx + dy*dy)
+        return float(np.average(dist, weights=self.weights))
 
     # -----------------------------------------------------
     # Estimate
